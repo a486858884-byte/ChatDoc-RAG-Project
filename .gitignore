@@ -1,0 +1,10 @@
+# 忽略 Conda 环境和 Python 缓存
+.idea/
+__pycache__/
+*.pyc
+
+# 忽略本地模型缓存文件夹
+models/
+
+# 忽略包含 API 密钥的 .env 文件 (极其重要！)
+.env
