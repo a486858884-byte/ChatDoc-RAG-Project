@@ -2,7 +2,6 @@ import os
 import getpass
 from dotenv import load_dotenv
 import sys
-
 # --- [关键修改] ---
 # 1. 获取当前脚本文件所在的目录的绝对路径
 #    __file__ 是一个 Python 内置变量，代表当前脚本的文件名
@@ -24,8 +23,6 @@ print(f"模型缓存的绝对路径已设置为: {os.environ['SENTENCE_TRANSFORM
 # --- ChatDoc 项目施工蓝图 ---
 # 1. 准备工作：导入所有需要的“建筑材料”（库）
 from encodings import normalize_encoding
-
-from IPython.core.debugger import prompt
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.chat_models import init_chat_model
 from langchain_community.document_loaders import TextLoader
@@ -42,6 +39,7 @@ from openai import embeddings
 from sentence_transformers.util import normalize_embeddings
 from sympy.physics.units import temperature
 from torch.nn.init import normal
+
 
 # 2. 环境准备：加载并设置 API 密钥
 load_dotenv()
