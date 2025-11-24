@@ -2,9 +2,16 @@
 .idea/
 __pycache__/
 *.pyc
-
 # 忽略本地模型缓存文件夹
 models/
-
 # 忽略包含 API 密钥的 .env 文件 (极其重要！)
 .env
+# 虚拟环境
+venv/
+env/
+.venv/
+# IDE 配置
+.idea/
+.vscode/
+# Mac 系统垃圾
+.DS_Store
