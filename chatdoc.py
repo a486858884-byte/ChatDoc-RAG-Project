@@ -87,24 +87,54 @@ embeddings = HuggingFaceEmbeddings(
 )
 
 # 3. 构建知识库
-print("正在加载文档并构建知识库...")
-# 确保 sample.txt 路径正确，如果报错找不到文件，可能需要用绝对路径
+print("正在加载知识库...")
+
+# 定义一个存索引的文件夹名字
+# os.path.join 保证了不管你在 Windows 还是 Linux 都能跑
+INDEX_PATH = os.path.join(script_dir, "faiss_index_store")
+
 try:
-    loader = TextLoader(os.path.join(script_dir, "sample.txt"), encoding="utf-8")
-    docs = loader.load()
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    split_docs = text_splitter.split_documents(docs)
-    vector_store = FAISS.from_documents(split_docs, embeddings)
-    retriever = vector_store.as_retriever()
+    # --- 分支一：检查本地有没有索引文件 ---
+    if os.path.exists(INDEX_PATH):
+        print("✅ 发现本地索引，正在直接加载 (省流模式)...")
+
+        # 【关键点】 allow_dangerous_deserialization=True
+        # 新版 LangChain 为了安全（防止加载恶意 pickle 文件）加的锁。
+        # 因为是你自己生成的文件，自己信自己，设为 True 没问题。
+        vector_store = FAISS.load_local(
+            INDEX_PATH,
+            embeddings,
+            allow_dangerous_deserialization=True
+        )
+        retriever = vector_store.as_retriever()
+
+    # --- 分支二：本地没有，老老实实去算 ---
+    else:
+        print("⚡ 未发现本地索引，正在重新构建 (这将消耗 Token)...")
+
+        # 这一段是你原来的逻辑
+        loader = TextLoader(os.path.join(script_dir, "sample.txt"), encoding="utf-8")
+        docs = loader.load()
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        split_docs = text_splitter.split_documents(docs)
+
+        vector_store = FAISS.from_documents(split_docs, embeddings)
+
+        # 【关键点】 算完立刻存盘！
+        vector_store.save_local(INDEX_PATH)
+        print(f"✅ 索引已保存到: {INDEX_PATH}")
+
+        retriever = vector_store.as_retriever()
+
 except Exception as e:
-    print(f"知识库构建失败 (可能是文件路径问题): {e}")
-    # 为了防止程序崩溃，给个空 retriever (仅用于调试)
+    print(f"❌ 知识库加载失败: {e}")
+    # 如果出错（比如文件夹坏了），你可能得手动删了那个文件夹重跑
     retriever = None
 
 # 4. 创建 RAG 链
 if retriever:
     prompt = ChatPromptTemplate.from_template("""
-    请只根据下面提供的上下文来回答用户的问题...
+    你是一个逻辑严密的 AI 助手。请根据下面的上下文回答问题。在回答之前，请先进行**一步步的逻辑推理 (Chain of Thought)**，引用上下文中的具体证据。
     <context>{context}</context>
     问题: {input}
     """)
@@ -150,6 +180,16 @@ def get_rag_response(user_input):
     try:
         # 1. AI 思考
         response = retrieval_chain.invoke({"input": user_input})
+        print(f"\n[DEBUG] 用户问题: {user_input}")
+
+        # 把检索到的文档片段打印出来看看！
+        # source_documents 或者 context，取决于你的链怎么建的，通常是 context
+        context_docs = response.get("context", [])
+        print(f"[DEBUG] 检索到的参考文档 ({len(context_docs)} 条):")
+        for i, doc in enumerate(context_docs):
+            # page_content 就是切分后的那 500 字原文
+            print(f"  --- 文档片段 {i + 1} ---")
+            print(f"  {doc.page_content[:100]}...")  # 只打前100字看看
         ai_answer = response["answer"]
 
         # 2. 存入数据库 (如果有连接)
