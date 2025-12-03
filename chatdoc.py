@@ -1,33 +1,47 @@
-# 1. 准备工作：导入所有需要的“建筑材料”（库）
+# ===================================================================
+# 文件名: chatdoc.py
+# 版本: Agentic RAG Final (集成 LangGraph + 熔断机制 + MySQL)
+# ===================================================================
+
 import os
 import sys
 import getpass
+from typing import TypedDict, List
 from dotenv import load_dotenv
+
+# --- 数据库组件 ---
 import mysql.connector
 from mysql.connector import Error
 
-# --- LangChain 核心组件 ---
+# --- LangChain / LangGraph 核心组件 ---
 from langchain.chat_models import init_chat_model
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.document_loaders import TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_classic.chains import create_retrieval_chain
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.documents import Document
+from pydantic import BaseModel, Field
+from langgraph.graph import StateGraph, END
 
 # ===================================================================
-# 核心环境变量设置
+# 1. 环境与基础设施初始化 (Infrastructure)
 # ===================================================================
+print("=== 系统启动中 ===")
+
+# 1.1 加载环境变量
 script_dir = os.path.dirname(os.path.abspath(__file__))
+load_dotenv()
 cache_dir = os.path.join(script_dir, "models")
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 os.environ['SENTENCE_TRANSFORMERS_HOME'] = cache_dir
 
+if not os.environ.get("DEEPSEEK_API_KEY"):
+    print("⚠️ 警告：未检测到 DEEPSEEK_API_KEY，请检查 .env 文件")
 
-# ===================================================================
-# 数据库辅助函数 (保持不变)
-# ===================================================================
+
+# 1.2 初始化数据库连接
 def create_db_connection(host_name, user_name, user_password, db_name):
     connection = None
     try:
@@ -37,21 +51,19 @@ def create_db_connection(host_name, user_name, user_password, db_name):
             passwd=user_password,
             database=db_name
         )
-        print("MySQL 数据库连接成功！")
+        print("✅ MySQL 数据库连接成功")
     except Error as e:
-        print(f"连接失败，错误信息: '{e}'")
+        print(f"⚠️ 数据库连接失败 (仅影响记录存储): {e}")
     return connection
 
 
 def execute_read_query(connection, query):
     cursor = connection.cursor()
-    result = None
     try:
         cursor.execute(query)
-        result = cursor.fetchall()
-        return result
+        return cursor.fetchall()
     except Error as e:
-        print(f"查询失败，错误信息: '{e}'")
+        print(f"查询错误: {e}")
 
 
 def execute_write_query(connection, query, data=None):
@@ -59,26 +71,26 @@ def execute_write_query(connection, query, data=None):
     try:
         cursor.execute(query, data)
         connection.commit()
-        # print("查询执行成功！") # 注释掉，避免刷屏
     except Error as e:
-        print(f"查询失败，错误信息: '{e}'")
+        print(f"写入错误: {e}")
 
 
-# ===================================================================
-# !!! 全局初始化 (从 main 里搬出来的，顶格写) !!!
-# 这样 app.py 导入时，这些代码会自动运行，变量就能被使用了
-# ===================================================================
+# 连接数据库 & 初始化用户
+db_conn = create_db_connection("localhost", "root", "1234", "chatdoc_db")
+current_user_id = None
+if db_conn:
+    current_username = "alice"
+    # 简单的用户检查/创建逻辑
+    user_in_db = execute_read_query(db_conn, f"SELECT id FROM users WHERE username = '{current_username}'")
+    if user_in_db:
+        current_user_id = user_in_db[0][0]
+    else:
+        execute_write_query(db_conn, f"INSERT INTO users (username) VALUES ('{current_username}')")
+        user_in_db = execute_read_query(db_conn, f"SELECT id FROM users WHERE username = '{current_username}'")
+        if user_in_db: current_user_id = user_in_db[0][0]
 
-print("=== 系统初始化开始 ===")
-
-# 1. 加载 API
-load_dotenv()
-if not os.environ.get("DEEPSEEK_API_KEY"):
-    # 注意：在 Streamlit 环境下，input/getpass 可能无法交互，最好确保 .env 里有 key
-    print("警告：未找到 API Key，请确保 .env 文件配置正确")
-
-# 2. 初始化模型
-print("正在初始化模型...")
+# 1.3 初始化模型 (LLM & Embeddings)
+print("正在加载 AI 模型...")
 llm = init_chat_model("deepseek-chat", model_provider="deepseek", temperature=0.1)
 embeddings = HuggingFaceEmbeddings(
     model_name="BAAI/bge-large-zh-v1.5",
@@ -86,134 +98,247 @@ embeddings = HuggingFaceEmbeddings(
     encode_kwargs={'normalize_embeddings': True}
 )
 
-# 3. 构建知识库
+# 1.4 初始化向量知识库 (FAISS)
 print("正在加载知识库...")
-
-# 定义一个存索引的文件夹名字
-# os.path.join 保证了不管你在 Windows 还是 Linux 都能跑
 INDEX_PATH = os.path.join(script_dir, "faiss_index_store")
+retriever = None
 
 try:
-    # --- 分支一：检查本地有没有索引文件 ---
     if os.path.exists(INDEX_PATH):
-        print("✅ 发现本地索引，正在直接加载 (省流模式)...")
-
-        # 【关键点】 allow_dangerous_deserialization=True
-        # 新版 LangChain 为了安全（防止加载恶意 pickle 文件）加的锁。
-        # 因为是你自己生成的文件，自己信自己，设为 True 没问题。
-        vector_store = FAISS.load_local(
-            INDEX_PATH,
-            embeddings,
-            allow_dangerous_deserialization=True
-        )
+        print("✅ 加载本地索引...")
+        vector_store = FAISS.load_local(INDEX_PATH, embeddings, allow_dangerous_deserialization=True)
         retriever = vector_store.as_retriever()
-
-    # --- 分支二：本地没有，老老实实去算 ---
     else:
-        print("⚡ 未发现本地索引，正在重新构建 (这将消耗 Token)...")
-
-        # 这一段是你原来的逻辑
+        print("⚡ 构建新索引 (耗时操作)...")
         loader = TextLoader(os.path.join(script_dir, "sample.txt"), encoding="utf-8")
         docs = loader.load()
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
         split_docs = text_splitter.split_documents(docs)
-
         vector_store = FAISS.from_documents(split_docs, embeddings)
-
-        # 【关键点】 算完立刻存盘！
         vector_store.save_local(INDEX_PATH)
-        print(f"✅ 索引已保存到: {INDEX_PATH}")
-
         retriever = vector_store.as_retriever()
-
 except Exception as e:
-    print(f"❌ 知识库加载失败: {e}")
-    # 如果出错（比如文件夹坏了），你可能得手动删了那个文件夹重跑
-    retriever = None
+    print(f"❌ 知识库加载严重错误: {e}")
 
-# 4. 创建 RAG 链
-if retriever:
-    prompt = ChatPromptTemplate.from_template("""
-    你是一个逻辑严密的 AI 助手。请根据下面的上下文回答问题。在回答之前，请先进行**一步步的逻辑推理 (Chain of Thought)**，引用上下文中的具体证据。
-    <context>{context}</context>
-    问题: {input}
-    """)
-    document_chain = create_stuff_documents_chain(llm, prompt)
-    retrieval_chain = create_retrieval_chain(retriever, document_chain)
-    print("AI 处理链创建完成！")
-else:
-    retrieval_chain = None
 
-# 5. 初始化数据库连接
-print("正在连接数据库...")
-# !!! 请确保这里的密码是正确的 !!!
-db_conn = create_db_connection("localhost", "root", "1234", "chatdoc_db")
+# ===================================================================
+# 2. Agent 大脑构建区 (The Brain)
+# ===================================================================
 
-# 6. 初始化用户 (硬编码 Alice)
-current_user_id = None
-if db_conn:
-    current_username = "alice"
-    user_in_db = execute_read_query(db_conn, f"SELECT id FROM users WHERE username = '{current_username}'")
-    if user_in_db:
-        current_user_id = user_in_db[0][0]
-        print(f"用户 {current_username} 已加载 (ID: {current_user_id})")
+# 2.1 定义共享内存 (State)
+class GraphState(TypedDict):
+    question: str  # 用户原始问题
+    generation: str  # 生成的答案
+    documents: List[Document]  # 文档列表
+    grade: str  # 评分 yes/no
+    search_query: str  # 搜索词
+    loop_step: int  # 熔断计数器
+
+
+# 2.2 定义工具链 (Chains)
+
+# A. 质检链 (Grader)
+class GradeDocuments(BaseModel):
+    binary_score: str = Field(description="文档相关性评分，'yes' 或 'no'")
+
+
+structured_llm_grader = llm.with_structured_output(GradeDocuments)
+grade_prompt = ChatPromptTemplate.from_messages([
+    ("system", "你是一个严厉的阅卷老师。评估文档片段是否与问题相关。相关评'yes'，不相关评'no'。"),
+    ("human", "问题: {question} \n\n 文档: {document}"),
+])
+retrieval_grader = grade_prompt | structured_llm_grader
+
+# B. 生成链 (Writer)
+# --- B. 生成链 (Writer) - 修正版 ---
+generate_prompt = ChatPromptTemplate.from_messages([
+    ("system", """你是一个完全依赖上下文的严谨 AI 助手。
+    1. 你只能根据提供的【上下文】回答问题。
+    2. **严禁**使用你的预训练知识或外部知识。
+    3. 如果【上下文】中找不到答案，或者上下文是空的，你必须直接回答：“抱歉，当前知识库中没有关于此问题的记录。”
+    4. 不要编造，不要尝试去定义你自己，除非文档里明确写了。"""),
+    ("human", "上下文: \n{context} \n\n 问题: {question}"),
+])
+rag_chain = generate_prompt | llm | StrOutputParser()
+
+# C. 改写链 (Rewriter)
+rewrite_prompt = ChatPromptTemplate.from_messages([
+    ("system", "你是搜索优化专家。将用户问题改写为更精准的搜索关键词。只输出改写后的内容。"),
+    ("human", "原始输入: {question}"),
+])
+question_rewriter = rewrite_prompt | llm | StrOutputParser()
+
+
+# 2.3 定义节点函数 (Nodes)
+
+def retrieve(state: GraphState):
+    """节点：检索"""
+    print("---NODE: RETRIEVE---")
+    query = state["search_query"]
+    documents = retriever.invoke(query)
+    print(f"  => 搜到 {len(documents)} 条文档")
+    return {"documents": documents}
+
+
+def grade_documents(state: GraphState):
+    """节点：质检"""
+    print("---NODE: GRADE---")
+    question = state["question"]
+    documents = state["documents"]
+
+    filtered_docs = []
+    for d in documents:
+        score = retrieval_grader.invoke({"question": question, "document": d.page_content})
+        if score.binary_score == "yes":
+            filtered_docs.append(d)
+
+    global_grade = "yes" if len(filtered_docs) > 0 else "no"
+    print(f"  => 质检结果: {global_grade} (保留 {len(filtered_docs)} 条)")
+    return {"documents": filtered_docs, "grade": global_grade}
+
+
+def generate(state: GraphState):
+    """节点：生成"""
+    print("---NODE: GENERATE---")
+    question = state["question"]
+    documents = state["documents"]
+    context = "\n\n".join([d.page_content for d in documents])
+    generation = rag_chain.invoke({"context": context, "question": question})
+    return {"generation": generation}
+
+
+def rewrite_query(state: GraphState):
+    """节点：改写 (带熔断监控)"""
+    print("---NODE: REWRITE---")
+    try:
+        current_step = state.get("loop_step", 0)
+        print(f"  [DEBUG] 重试计数: {current_step}")
+
+        better_query = question_rewriter.invoke({"question": state["question"]})
+        print(f"  => 优化搜索词: {better_query}")
+
+        return {"search_query": better_query, "loop_step": current_step + 1}
+    except Exception as e:
+        print(f"❌ Rewrite 节点出错: {e}")
+        return {"search_query": state["question"], "loop_step": state.get("loop_step", 0) + 1}
+
+
+def decide_to_generate(state):
+    """路由逻辑 (带熔断)"""
+    print("---DECISION---")
+    grade = state["grade"]
+    current_step = state.get("loop_step", 0)
+
+    if current_step >= 3:
+        print("  => ⚠️ 触发熔断 (Max Retries)，强制生成。")
+        return "generate"
+
+    if grade == "yes":
+        return "generate"
     else:
-        print(f"创建新用户 {current_username}...")
-        execute_write_query(db_conn, f"INSERT INTO users (username) VALUES ('{current_username}')")
-        user_in_db = execute_read_query(db_conn, f"SELECT id FROM users WHERE username = '{current_username}'")
-        if user_in_db:
-            current_user_id = user_in_db[0][0]
+        print("  => 质量不达标，尝试改写...")
+        return "rewrite_query"
 
-print("=== 系统初始化完成 ===")
+
+# 2.4 组装图 (Workflow)
+app = None
+if retriever:
+    print("正在组装 Agent 神经网络...")
+    workflow = StateGraph(GraphState)
+
+    # 添加节点
+    workflow.add_node("retrieve", retrieve)
+    workflow.add_node("grade_documents", grade_documents)
+    workflow.add_node("generate", generate)
+    workflow.add_node("rewrite_query", rewrite_query)
+
+    # 连线
+    workflow.set_entry_point("retrieve")
+    workflow.add_edge("retrieve", "grade_documents")
+    workflow.add_edge("rewrite_query", "retrieve")
+    workflow.add_edge("generate", END)
+
+    # 条件边
+    workflow.add_conditional_edges(
+        "grade_documents",
+        decide_to_generate,
+        {
+            "generate": "generate",
+            "rewrite_query": "rewrite_query"
+        }
+    )
+
+    app = workflow.compile()
+    print("✅ Agent 编译完成！")
+else:
+    print("❌ Agent 组装失败：Retriever 未就绪")
 
 
 # ===================================================================
-# !!! 核心接口函数 (供 Streamlit 调用) !!!
+# 3. 对外接口 (API Interface)
 # ===================================================================
+
 def get_rag_response(user_input):
     """
-    接收用户问题，调用 RAG 链，存入数据库，返回答案
+    统一入口：接收用户问题 -> 运行 Agent -> 存库 -> 返回答案
     """
-    if not retrieval_chain:
-        return "错误：知识库未正确初始化，请检查后台日志。"
+    if not app:
+        return "系统错误：Agent 未就绪。"
 
     try:
-        # 1. AI 思考
-        response = retrieval_chain.invoke({"input": user_input})
-        print(f"\n[DEBUG] 用户问题: {user_input}")
+        # 1. 构造输入 (初始化熔断计数器)
+        inputs = {
+            "question": user_input,
+            "search_query": user_input,
+            "loop_step": 0
+        }
 
-        # 把检索到的文档片段打印出来看看！
-        # source_documents 或者 context，取决于你的链怎么建的，通常是 context
-        context_docs = response.get("context", [])
-        print(f"[DEBUG] 检索到的参考文档 ({len(context_docs)} 条):")
-        for i, doc in enumerate(context_docs):
-            # page_content 就是切分后的那 500 字原文
-            print(f"  --- 文档片段 {i + 1} ---")
-            print(f"  {doc.page_content[:100]}...")  # 只打前100字看看
-        ai_answer = response["answer"]
+        print(f"\n🚀 [Agent 启动] 问题: {user_input}")
 
-        # 2. 存入数据库 (如果有连接)
+        # 2. 运行图
+        final_state = app.invoke(inputs)
+
+        # 3. 提取结果
+        ai_answer = final_state.get("generation", "抱歉，未能生成回答。")
+        retry_count = final_state.get("loop_step", 0)
+
+        # 4. 存入数据库
         if db_conn and current_user_id:
-            insert_query = """
-            INSERT INTO conversations (user_id, user_message, ai_response) 
-            VALUES (%s, %s, %s);
-            """
-            data = (current_user_id, user_input, ai_answer)
-            execute_write_query(db_conn, insert_query, data)
+            insert_query = "INSERT INTO conversations (user_id, user_message, ai_response) VALUES (%s, %s, %s);"
+            execute_write_query(db_conn, insert_query, (current_user_id, user_input, ai_answer))
+
+        # (可选) 在控制台展示一下有没有触发重试
+        if retry_count > 0:
+            print(f"✨ 本次回答触发了 {retry_count} 次自我修正。")
 
         return ai_answer
 
     except Exception as e:
-        return f"发生错误: {str(e)}"
+        import traceback
+        traceback.print_exc()
+        return f"运行出错: {str(e)}"
 
 
 # ===================================================================
-# 命令行测试入口 (仅当直接运行 chatdoc.py 时执行)
+# 4. 命令行测试入口
 # ===================================================================
 if __name__ == '__main__':
-    print("\n进入命令行测试模式...")
+    print("\n✅ 系统已就绪。进入命令行测试模式...")
+    print("提示：尝试输入模糊问题触发重试，如 '那玩意儿要预热多久？'")
+
     while True:
-        q = input("请输入问题 (输入 quit 退出): ")
-        if q.lower() in ['quit', 'exit']:
+        try:
+            q = input("\n请输入问题 (quit退出): ")
+            if q.lower() in ['quit', 'exit']:
+                break
+
+            # 调用封装好的接口
+            answer = get_rag_response(q)
+            print(f"\n🤖 AI 回答:\n{answer}")
+
+        except KeyboardInterrupt:
             break
-        print("回答:", get_rag_response(q))
+
+    if db_conn:
+        db_conn.close()
+        print("数据库连接已关闭。")
